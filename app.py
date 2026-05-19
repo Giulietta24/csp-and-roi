@@ -3,33 +3,69 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from math import log, sqrt, exp
+from scipy.stats import norm
 
-st.set_page_config(page_title="Options Dashboard (Income + Growth)", layout="wide")
+st.set_page_config(page_title="Options Dashboard (Stable C Model)", layout="wide")
 
-st.title("📊 Options Income + Growth Dashboard (Option C Model)")
+st.title("📊 Options Dashboard (Option C - Stable Version)")
 
-# ---------------------------
-# Inputs
-# ---------------------------
+# =========================
+# CACHING LAYER (IMPORTANT)
+# =========================
+@st.cache_data(ttl=300)
+def get_ticker(symbol):
+    return yf.Ticker(symbol)
+
+@st.cache_data(ttl=300)
+def get_price(symbol):
+    return yf.Ticker(symbol).history(period="1d")["Close"].iloc[-1]
+
+# =========================
+# BLACK SCHOLES HELPERS
+# =========================
+def bs_delta(S, K, T, r, sigma, option_type="call"):
+    if T <= 0:
+        return 0
+    d1 = (log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*sqrt(T))
+    if option_type == "call":
+        return norm.cdf(d1)
+    else:
+        return norm.cdf(d1) - 1
+
+def bs_theta(S, K, T, r, sigma, option_type="call"):
+    if T <= 0:
+        return 0
+    d1 = (log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*sqrt(T))
+    d2 = d1 - sigma*sqrt(T)
+
+    first = -(S * norm.pdf(d1) * sigma) / (2 * sqrt(T))
+
+    if option_type == "call":
+        second = r*K*exp(-r*T)*norm.cdf(d2)
+        return first - second
+    else:
+        second = r*K*exp(-r*T)*norm.cdf(-d2)
+        return first + second
+
+# =========================
+# INPUTS
+# =========================
 ticker_input = st.sidebar.text_input("Ticker", "AAPL").upper()
-target_price = st.sidebar.number_input("Target Price (for Calls)", value=200.0)
+target_price = st.sidebar.number_input("Target Price (Calls)", value=200.0)
 
-ticker = yf.Ticker(ticker_input)
-
-try:
-    current_price = ticker.history(period="1d")["Close"].iloc[-1]
-except:
-    st.error("Invalid ticker or no data available.")
-    st.stop()
+ticker = get_ticker(ticker_input)
+current_price = get_price(ticker_input)
 
 st.subheader(f"{ticker_input} Price: ${current_price:.2f}")
 
-# ---------------------------
-# Expirations
-# ---------------------------
-expirations = ticker.options
-if not expirations:
-    st.error("No options available.")
+# =========================
+# EXPIRATIONS (SAFE)
+# =========================
+try:
+    expirations = ticker.options
+except:
+    st.error("Yahoo blocked request. Try again in 1–2 minutes.")
     st.stop()
 
 expiry = st.sidebar.selectbox("Expiration", expirations)
@@ -38,75 +74,49 @@ chain = ticker.option_chain(expiry)
 calls = chain.calls.copy()
 puts = chain.puts.copy()
 
-days_to_expiry = max((datetime.strptime(expiry, "%Y-%m-%d") - datetime.today()).days, 1)
+days = max((datetime.strptime(expiry, "%Y-%m-%d") - datetime.today()).days, 1)
+T = days / 365
+r = 0.04
+sigma = 0.25  # fallback IV assumption
 
-# =========================================================
-# SAFE GREKS HANDLING (Yahoo fallback)
-# =========================================================
-def safe_col(df, col):
-    if col in df.columns:
-        return df[col]
-    return np.nan
-
-for df in [calls, puts]:
-    if "delta" not in df.columns:
-        df["delta"] = np.nan
-    if "theta" not in df.columns:
-        df["theta"] = np.nan
-
-# Fallback estimates if missing
-puts["delta"] = puts["delta"].fillna(-0.25)
-calls["delta"] = calls["delta"].fillna(0.30)
-
-puts["theta"] = puts["theta"].fillna(-0.05)
-calls["theta"] = calls["theta"].fillna(-0.05)
-
-# =========================================================
-# ===================== CSP MODEL =========================
-# =========================================================
+# =========================
+# CSP MODEL (OPTION C)
+# =========================
 puts["premium"] = puts["lastPrice"]
 puts["collateral"] = puts["strike"] * 100
-puts["max_income"] = puts["premium"] * 100
+puts["roc"] = (puts["premium"] * 100) / puts["collateral"]
 
-puts["breakeven"] = puts["strike"] - puts["premium"]
+puts["delta"] = puts["strike"].apply(lambda k: bs_delta(current_price, k, T, r, sigma, "put"))
+puts["theta"] = puts["strike"].apply(lambda k: bs_theta(current_price, k, T, r, sigma, "put"))
 
-# ROC
-puts["roc"] = puts["max_income"] / puts["collateral"]
+puts["theta_score"] = abs(puts["theta"]) * 100
+puts["otm_score"] = np.clip(0.3 - abs(puts["delta"]), 0, 0.3)
 
-# Theta income (positive benefit)
-puts["theta_income"] = abs(puts["theta"]) * 100
-
-# Probability proxy (OTM safety)
-puts["otm_score"] = np.clip(0.30 - abs(puts["delta"]), 0, 0.30)
-
-# ================= OPTION C WEIGHTS =================
-# Theta 45%, ROC 35%, OTM safety 20%
+# OPTION C WEIGHTS (CLEAN VERSION)
 puts["income_score"] = (
-    puts["theta_income"] * 0.45 +
+    puts["theta_score"] * 0.45 +
     puts["roc"] * 100 * 0.35 +
     puts["otm_score"] * 100 * 0.20
 )
 
 best_csp = puts.sort_values("income_score", ascending=False).head(1)
 
-# =========================================================
-# ===================== CALL MODEL ========================
-# =========================================================
+# =========================
+# CALL MODEL (OPTION C)
+# =========================
 calls["premium"] = calls["lastPrice"]
 calls["cost"] = calls["premium"] * 100
 
-calls["break_even"] = calls["strike"] + calls["premium"]
-
 calls["profit_at_target"] = (target_price - calls["strike"] - calls["premium"]) * 100
-
 calls["roi"] = calls["profit_at_target"] / calls["cost"]
 
+calls["delta"] = calls["strike"].apply(lambda k: bs_delta(current_price, k, T, r, sigma, "call"))
+calls["theta"] = calls["strike"].apply(lambda k: bs_theta(current_price, k, T, r, sigma, "call"))
+
 calls["theta_penalty"] = abs(calls["theta"]) * 100
+calls["delta_score"] = calls["delta"]
 
-calls["delta_score"] = np.clip(calls["delta"], 0, 1)
-
-# ================= OPTION C WEIGHTS =================
-# ROI 50%, Delta 30%, Theta penalty 20%
+# OPTION C WEIGHTS
 calls["growth_score"] = (
     calls["roi"].fillna(-1) * 50 +
     calls["delta_score"] * 30 +
@@ -115,65 +125,19 @@ calls["growth_score"] = (
 
 best_call = calls.sort_values("growth_score", ascending=False).head(1)
 
-# =========================================================
-# ===================== RESULTS ===========================
-# =========================================================
-
-st.header("🏆 Recommended Trades (Auto-Selected)")
+# =========================
+# OUTPUT
+# =========================
+st.header("🏆 Best Trades (Stable Option C)")
 
 col1, col2 = st.columns(2)
 
 with col1:
-    st.subheader("💰 Best Income Trade (CSP)")
-    st.dataframe(best_csp[[
-        "contractSymbol", "strike", "premium", "breakeven",
-        "roc", "theta_income", "delta", "income_score"
-    ]])
-
-    st.success("Selected using: Theta (45%), ROC (35%), OTM safety (20%)")
+    st.subheader("💰 Best CSP")
+    st.dataframe(best_csp[["strike","premium","roc","delta","theta","income_score"]])
 
 with col2:
-    st.subheader("🚀 Best Growth Trade (Call)")
-    st.dataframe(best_call[[
-        "contractSymbol", "strike", "premium",
-        "break_even", "profit_at_target",
-        "roi", "delta", "growth_score"
-    ]])
+    st.subheader("🚀 Best Call")
+    st.dataframe(best_call[["strike","premium","roi","delta","theta","growth_score"]])
 
-    st.success("Selected using: ROI (50%), Delta (30%), Theta penalty (20%)")
-
-# =========================================================
-# FULL TABLES
-# =========================================================
-
-st.header("📊 Full Option Chains")
-
-st.subheader("Puts (Income)")
-st.dataframe(puts.sort_values("income_score", ascending=False))
-
-st.subheader("Calls (Growth)")
-st.dataframe(calls.sort_values("growth_score", ascending=False))
-
-# =========================================================
-# EXPLANATION PANEL
-# =========================================================
-
-st.header("🧠 How the Model Thinks")
-
-st.markdown("""
-### 💰 Income (CSP)
-- **Theta (45%)** → how fast you collect premium decay  
-- **ROC (35%)** → capital efficiency  
-- **OTM safety (20%)** → probability of expiring worthless  
-
-👉 Result: finds *high yield + high probability* cash-secured puts
-
----
-
-### 🚀 Growth (Calls)
-- **ROI (50%)** → leverage at your target price  
-- **Delta (30%)** → directional strength  
-- **Theta penalty (20%)** → avoids rapid decay contracts  
-
-👉 Result: finds *best asymmetric upside trades*
-""")
+st.success("Stable Option C model running (no reliance on Yahoo Greeks).")
